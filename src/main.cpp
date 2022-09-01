@@ -16,8 +16,8 @@ LiquidCrystal_I2C lcd(0x27, 16, 2);
 // change this to the number of steps on your motor
 #define STEPS 100
 
-// the previous reading from the analog input
-int previous = 0;
+int runtime = 0;
+int lastDisplayUpdateTime;
 
 struct IRButtons{
     char power[9] = "ba45ff00";
@@ -27,7 +27,7 @@ struct IRButtons{
     char play[9] = "bf40ff00";
     char frwrd[9] = "bc43ff00";
     char down[9] = "f807ff00";
-    char VolDwn[9] = "ea15ff00";
+    char volDwn[9] = "ea15ff00";
     char up[9] = "f609ff00";
     char zero[9] = "e916ff00";
     char eq[9] = "e619ff00";
@@ -60,7 +60,7 @@ struct Motor{
     int button2;
     int pins[4] = {0};
     Stepper stepper = Stepper(STEPS, 0, 0, 0, 0);
-    void init() {
+    void init(int steps = STEPS, int speed = 30) {
         pinMode(button1, INPUT);
         pinMode(button2, INPUT);
 
@@ -69,13 +69,16 @@ struct Motor{
         pinMode(pins[2], OUTPUT);
         pinMode(pins[3], OUTPUT);
 
-        stepper = Stepper(STEPS, pins[0], pins[1], pins[2], pins[3]);
-        stepper.setSpeed(30); // set the speed of the motor to 30 RPMs
+        stepper = Stepper(steps, pins[0], pins[1], pins[2], pins[3]);
+        stepper.setSpeed(speed); // set the speed of the motor to 30 RPMs
     }
     bool scrolling = false;
     float source;
     float destination;
-    void scrollTo(float coord) {
+    void scrollTo(float  coord) {
+        if (coord == position)
+            return;
+
         Serial.println("Scrolling to " + String(coord));
 
         source = position;
@@ -84,6 +87,8 @@ struct Motor{
     }
     //This must be <= 1
     void changePosition(float amount) {
+        Serial.println("Changing by: " + String(amount));
+
         //The stepper only takes ints so accomodate for that
         if ((int)lastPosition != (int)position)
             stepper.step(amount < 0 ? 1 : -1);
@@ -146,6 +151,8 @@ void drawScreen(String message, bool updateStatus) {
 
     if (updateStatus)
         sendStatus();
+
+    lastDisplayUpdateTime = runtime;
 }
 void alert(String message, int timer = 1000);
 void alert(String message, int timer) {
@@ -156,23 +163,18 @@ void alert(String message, int timer) {
     drawScreen("", false);
 }
 
-void scrollToStart() {
-    alert("Scrolling to Start");
+//Use -1 to not move axis at all
+void scrollToCoords(float x, float y, float z) {
+    for (int i = 0; i < 3; i++) {
+        if (i == 0 && x > -1)
+            motors[i].scrollTo(x);
 
-    for (auto & motor : motors)
-        motor.scrollTo(0);
-}
-void scrollToEnd() {
-    alert("Scroll to End!");
+        if (i == 1 && y > -1)
+            motors[i].scrollTo(y);
 
-    for (auto & motor : motors)
-        motor.scrollTo(bed.size);
-}
-void scrollToCenter() {
-    alert("Scroll to Center!");
-
-    for (auto & motor : motors)
-        motor.scrollTo(bed.size / 2);
+        if (i == 2 && z > -1)
+            motors[i].scrollTo(z);
+    }
 }
 
 void initialize(bool skipRewind = false);
@@ -195,8 +197,13 @@ void initialize(bool skipRewind) {
         //Set a small margin
         int margin = 5;
         while (margin > 0) {
-            for (auto &motor: motors)
-                motor.stepper.step(-1);
+            int i = 0;
+            for (auto &motor: motors) {
+                if (i < 2)
+                    motor.stepper.step(-1);
+
+                i++;
+            }
 
             margin--;
         }
@@ -258,6 +265,12 @@ void setup() {
     lcd.backlight();
     drawScreen("Booting Up...");
 
+    //3D Pen Fwd
+    pinMode(18, OUTPUT);
+
+    //Temp pen btn
+    pinMode(19, INPUT);
+
     //connect to WiFi
     connectToWifi();
 
@@ -285,24 +298,41 @@ void setup() {
     motors[2].pins[1] = 0;
     motors[2].pins[2] = 2;
     motors[2].pins[3] = 15;
-    motors[2].init();
+    motors[2].init(32, 500);
 }
 
 void performIRFunction(char event[9]) {
+    Serial.println("Caught IR function " + String(event));
+
+    //Power Button = Full Initialize
     if (strcmp(event, buttons.power) == 0)
         initialize();
 
-    if (strcmp(event, buttons.back) == 0)
-        scrollToStart();
-
-    if (strcmp(event, buttons.frwrd) == 0)
-        scrollToEnd();
-
+    //Zero Button = Set initialized without moving motors
     if (strcmp(event, buttons.zero) == 0)
         initialize(true);
 
-    if (strcmp(event, buttons.play) == 0)
-        scrollToCenter();
+    //Skip Back = Zero all motors
+    if (strcmp(event, buttons.back) == 0)
+        scrollToCoords(0, 0, 0);
+
+    //Skip Forward = Max all motors
+    if (strcmp(event, buttons.frwrd) == 0)
+        scrollToCoords(bed.size, bed.size, bed.size);
+
+    //Play Button = Center all motors
+    if (strcmp(event, buttons.play) == 0) {
+        float half = (float)bed.size / 2;
+        scrollToCoords(half, half, half);
+    }
+
+    //Volume Down = Send position to back right corner
+    if (strcmp(event, buttons.volDwn) == 0)
+        scrollToCoords(0, bed.size, bed.size);
+
+    //Volume Up = Send position to front left corner
+    if (strcmp(event, buttons.volUp) == 0)
+        scrollToCoords(bed.size, 0, bed.size);
 
     Serial.println("Finished function " + String(event));
     alert("Func Complete");
@@ -382,18 +412,18 @@ void loop() {
     }
 
     //handle ir commands
-    if (IrReceiver.decode()) {
-        if (IrReceiver.decodedIRData.decodedRawData > 0) {
-            char code[9];
-            itoa(IrReceiver.decodedIRData.decodedRawData, code, 16);
-            performIRFunction(code);
-        }
-
-        IrReceiver.resume(); // Enable receiving of the next value
-    }
+//    if (IrReceiver.decode()) {
+//        if (IrReceiver.decodedIRData.decodedRawData > 0) {
+//            char code[9];
+//            itoa(IrReceiver.decodedIRData.decodedRawData, code, 16);
+//            performIRFunction(code);
+//        }
+//
+//        IrReceiver.resume(); // Enable receiving of the next value
+//    }
 
     //Handle Button Presses
-    int motorCount = 1;
+    int motorCount = 0;
     bool btnWasPressed = btnIsPressed;
     btnIsPressed = false;
     String btnDisplayStr = "Mv: "; //Directions are based on a perspective facing the front of the printer
@@ -410,13 +440,13 @@ void loop() {
             motor.changePosition(-increment);
 
             switch(motorCount) {
-                case 1:
+                case 0:
                     btnDisplayStr += " Bck ";
                     break;
-                case 2:
+                case 1:
                     btnDisplayStr += " L ";
                     break;
-                case 3:
+                case 2:
                     btnDisplayStr += " Up ";
                     break;
                 default:
@@ -428,13 +458,13 @@ void loop() {
             motor.changePosition(increment);
 
             switch(motorCount) {
-                case 1:
+                case 0:
                     btnDisplayStr += " Fwd ";
                     break;
-                case 2:
+                case 1:
                     btnDisplayStr += " R ";
                     break;
-                case 3:
+                case 2:
                     btnDisplayStr += " Dwn ";
                     break;
                 default:
@@ -445,12 +475,17 @@ void loop() {
         motorCount++;
     }
 
+    //If we're pressing a directional button display that on the screen
     if (btnIsPressed) {
         if (lastDisplayStr != btnDisplayStr)
             drawScreen(btnDisplayStr);
-    } else if (btnWasPressed) {
+
+    //Redraw the screen when we release a button or the last display update time is greater than (roughly) 5 seconds
+    } else if (btnWasPressed || runtime - lastDisplayUpdateTime > 500000) {
+        Serial.println("Runtime: " + String(runtime) + " | Last Update: " + String(lastDisplayUpdateTime));
         drawScreen();
     }
 
     lastDisplayStr = btnDisplayStr;
+    runtime++;
 }

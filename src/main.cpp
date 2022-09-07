@@ -5,7 +5,9 @@
 #include <LiquidCrystal_I2C.h>
 #include <ArduinoJson.h>
 #include <ArduinoHttpClient.h>
+#include <AsyncUDP.h>
 
+AsyncUDP UDP;
 char server[] = "hauntedhallow.xyz";
 WiFiClient client;
 HttpClient httpClient = HttpClient(client, server, 80);
@@ -52,6 +54,7 @@ struct PrintBed{
 };
 PrintBed bed;
 
+//Motor stuff
 struct Motor{
     bool ready = false;
     float position;
@@ -117,6 +120,28 @@ bool isInitialized() {
     return initialized;
 }
 
+//Pen vars
+#define PEN_FWD 19
+#define PEN_BCK 12
+struct PenObj {
+    bool Hot = false;
+    bool FeedMode = false;
+    void heat() {
+        digitalWrite(PEN_FWD, HIGH);
+        delay(500);
+        digitalWrite(PEN_FWD, LOW);
+        Hot = true;
+    }
+    void toggleFeedMode() {
+        if (FeedMode)
+            FeedMode = false;
+        else
+            FeedMode = true;
+    }
+};
+PenObj Pen;
+
+
 void sendPost(String uri, String data) {
     httpClient.beginRequest();
     int responseCode = httpClient.post(uri);
@@ -146,7 +171,10 @@ void drawScreen(String message, bool updateStatus) {
             lcd.print("Connected!");
 
         lcd.setCursor(0, 1);
-        lcd.print(isInitialized() ? "READY" : "PLEASE INIT");
+        if (Pen.FeedMode)
+            lcd.print("FEED MODE (Z Axis)");
+        else
+            lcd.print(isInitialized() ? "READY" : "PLEASE INIT");
     }
 
     if (updateStatus)
@@ -156,6 +184,7 @@ void drawScreen(String message, bool updateStatus) {
 }
 void alert(String message, int timer = 1000);
 void alert(String message, int timer) {
+    Serial.println("ALERT: " + message);
     drawScreen(message, false);
 
     delay(timer);
@@ -186,8 +215,8 @@ void initialize(bool skipRewind) {
         //Move all our motors to their starting positions
         int buffer = 300;
         while (buffer > 0) {
-            for (auto &motor: motors)
-                motor.stepper.step(+1);
+            for (int m = 0; m < 2; m++)
+                motors[m].stepper.step(+1);
 
             buffer--;
         }
@@ -197,13 +226,9 @@ void initialize(bool skipRewind) {
         //Set a small margin
         int margin = 5;
         while (margin > 0) {
-            int i = 0;
-            for (auto &motor: motors) {
+            for (int i = 0; i < 2; i++)
                 if (i < 2)
-                    motor.stepper.step(-1);
-
-                i++;
-            }
+                    motors[i].stepper.step(-1);
 
             margin--;
         }
@@ -216,9 +241,63 @@ void initialize(bool skipRewind) {
 
     //Draw the screen again after we re-init
     drawScreen();
-}       
+}
+
+void extrude(bool backwards = false);
+void extrude(bool backwards) {
+    Serial.println("Extruding | " + String(backwards));
+    if (backwards) {
+        digitalWrite(PEN_BCK, HIGH);
+        delay(5000);
+        digitalWrite(PEN_BCK, LOW);
+        return;
+    }
+
+    digitalWrite(PEN_FWD, HIGH);
+    delay(5000);
+    digitalWrite(PEN_FWD, LOW);
+}
 
 IPAddress LocalIP(192, 168, 1, 222);
+void processUdp(AsyncUDPPacket packet) {
+    //Validate the incoming IP address
+    String source = "UNKNOWN";
+    if (packet.remoteIP().toString().indexOf("128.199.7.114") != 0) {
+        alert("Received UDP request from unknown source");
+        return;
+    }
+
+    char* tmpStr = (char*) malloc(packet.length() + 1);
+    memcpy(tmpStr, packet.data(), packet.length());
+    tmpStr[packet.length()] = '\0'; // ensure null termination
+    String dataString = String(tmpStr);
+    free(tmpStr);
+
+    Serial.println("Received " + dataString + " from UDP@" + packet.remoteIP().toString());
+
+    StaticJsonDocument<200> json;
+    DeserializationError error = deserializeJson(json, dataString);
+    if (error) {
+        Serial.println("JSON ERROR!");
+        Serial.print(F("deserializeJson() failed: "));
+        Serial.println(error.f_str());
+        alert("DeserializeJson!");
+        return;
+    }
+
+    if (json.containsKey("CMD")) {
+        if (json["CMD"] == "PEN_ON") {
+            if (!Pen.Hot)
+                Pen.heat();
+        } else if (json["CMD"] == "PEN_FWD") {
+            extrude();
+        } else if (json["CMD"] == "PEN_BCK") {
+            extrude(true);
+        } else
+            alert("Requested action not recognized.");
+    } else
+        alert("Spirit requested no action.");
+}
 void connectToWifi() {
     WiFi.mode(WIFI_STA);
 
@@ -265,35 +344,41 @@ void setup() {
     lcd.backlight();
     drawScreen("Booting Up...");
 
-    //3D Pen Fwd
-    pinMode(18, OUTPUT);
-
-    //Temp pen btn
-    pinMode(19, INPUT);
+    //3D Pen
+    pinMode(PEN_BCK, OUTPUT); //Bck
+    pinMode(PEN_FWD, OUTPUT); //Fwd
 
     //connect to WiFi
     connectToWifi();
 
-    IrReceiver.begin(5, ENABLE_LED_FEEDBACK);
+    if(UDP.listen(LocalIP, 4225)) {
+        Serial.println("UDP listening locally on IP \"" + LocalIP.toString() + ":" + 4225 + "\"");
+        UDP.onPacket([](AsyncUDPPacket packet) {
+            Serial.println("Received UDP Packet. Processing...");
+            processUdp(packet);
+        });
+    }
 
-    motors[0].button1 = 39;
-    motors[0].button2 = 36;
-    motors[0].pins[0] = 32;
-    motors[0].pins[1] = 33;
-    motors[0].pins[2] = 25;
-    motors[0].pins[3] = 26;
+    IrReceiver.begin(18);
+
+    motors[0].button1 = 34;
+    motors[0].button2 = 35;
+    motors[0].pins[0] = 26;
+    motors[0].pins[1] = 27;
+    motors[0].pins[2] = 14;
+    motors[0].pins[3] = 13;
     motors[0].init();
 
-    motors[1].button1 = 35;
-    motors[1].button2 = 34;
-    motors[1].pins[0] = 27;
-    motors[1].pins[1] = 14;
-    motors[1].pins[2] = 12;
-    motors[1].pins[3] = 13;
+    motors[1].button1 = 36;
+    motors[1].button2 = 39;
+    motors[1].pins[0] = 32;
+    motors[1].pins[1] = 33;
+    motors[1].pins[2] = 25;
+    motors[1].pins[3] = 5;
     motors[1].init();
 
-    motors[2].button1 = 17;
-    motors[2].button2 = 16;
+    motors[2].button1 = 16;
+    motors[2].button2 = 17;
     motors[2].pins[0] = 4;
     motors[2].pins[1] = 0;
     motors[2].pins[2] = 2;
@@ -333,6 +418,14 @@ void performIRFunction(char event[9]) {
     //Volume Up = Send position to front left corner
     if (strcmp(event, buttons.volUp) == 0)
         scrollToCoords(bed.size, 0, bed.size);
+
+    //Func Button = Turn on pen
+    if (strcmp(event, buttons.func) == 0)
+        if (!Pen.Hot)
+            Pen.heat();
+        else
+            Pen.toggleFeedMode();
+
 
     Serial.println("Finished function " + String(event));
     alert("Func Complete");
@@ -412,15 +505,15 @@ void loop() {
     }
 
     //handle ir commands
-//    if (IrReceiver.decode()) {
-//        if (IrReceiver.decodedIRData.decodedRawData > 0) {
-//            char code[9];
-//            itoa(IrReceiver.decodedIRData.decodedRawData, code, 16);
-//            performIRFunction(code);
-//        }
-//
-//        IrReceiver.resume(); // Enable receiving of the next value
-//    }
+    if (IrReceiver.decode()) {
+        if (IrReceiver.decodedIRData.decodedRawData > 0) {
+            char code[9];
+            itoa(IrReceiver.decodedIRData.decodedRawData, code, 16);
+            performIRFunction(code);
+        }
+
+        IrReceiver.resume(); // Enable receiving of the next value
+    }
 
     //Handle Button Presses
     int motorCount = 0;
@@ -434,41 +527,54 @@ void loop() {
         //Btn is actually pressed when false (I think because the pullup resistor reverses this)
         bool btn1Pressed = !digitalRead(motor.button1);
         bool btn2Pressed = !digitalRead(motor.button2);
-        if (btn1Pressed) {
-            btnIsPressed = true;
+        if (Pen.FeedMode) {
+            if (btn1Pressed) {
+                btnIsPressed = true;
 
-            motor.changePosition(-increment);
-
-            switch(motorCount) {
-                case 0:
-                    btnDisplayStr += " Bck ";
-                    break;
-                case 1:
-                    btnDisplayStr += " L ";
-                    break;
-                case 2:
-                    btnDisplayStr += " Up ";
-                    break;
-                default:
-                    break;
+                digitalWrite(PEN_FWD, HIGH);
             }
-        }
-        if (btn2Pressed) {
-            btnIsPressed = true;
-            motor.changePosition(increment);
+            if (btn2Pressed) {
+                btnIsPressed = true;
 
-            switch(motorCount) {
-                case 0:
-                    btnDisplayStr += " Fwd ";
-                    break;
-                case 1:
-                    btnDisplayStr += " R ";
-                    break;
-                case 2:
-                    btnDisplayStr += " Dwn ";
-                    break;
-                default:
-                    break;
+                digitalWrite(PEN_BCK, HIGH);
+            }
+        } else {
+            if (btn1Pressed) {
+                btnIsPressed = true;
+
+                motor.changePosition(-increment);
+
+                switch (motorCount) {
+                    case 0:
+                        btnDisplayStr += " Bck ";
+                        break;
+                    case 1:
+                        btnDisplayStr += " L ";
+                        break;
+                    case 2:
+                        btnDisplayStr += " Up ";
+                        break;
+                    default:
+                        break;
+                }
+            }
+            if (btn2Pressed) {
+                btnIsPressed = true;
+                motor.changePosition(increment);
+
+                switch (motorCount) {
+                    case 0:
+                        btnDisplayStr += " Fwd ";
+                        break;
+                    case 1:
+                        btnDisplayStr += " R ";
+                        break;
+                    case 2:
+                        btnDisplayStr += " Dwn ";
+                        break;
+                    default:
+                        break;
+                }
             }
         }
 
@@ -481,9 +587,14 @@ void loop() {
             drawScreen(btnDisplayStr);
 
     //Redraw the screen when we release a button or the last display update time is greater than (roughly) 5 seconds
-    } else if (btnWasPressed || runtime - lastDisplayUpdateTime > 500000) {
+    } else if (btnWasPressed || runtime - lastDisplayUpdateTime > 3000000) {
         Serial.println("Runtime: " + String(runtime) + " | Last Update: " + String(lastDisplayUpdateTime));
         drawScreen();
+    }
+
+    if (!btnIsPressed && btnWasPressed && Pen.FeedMode) {
+        digitalWrite(PEN_BCK, LOW);
+        digitalWrite(PEN_FWD, LOW);
     }
 
     lastDisplayStr = btnDisplayStr;

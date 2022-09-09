@@ -75,6 +75,8 @@
  * https://docs.arduino.cc/learn/electronics/stepper-motors#circuit
  */
 
+#include <Adafruit_MCP23X17.h>
+
 // ensure this library description is only included once
 #ifndef Stepper_h
 #define Stepper_h
@@ -87,6 +89,8 @@ class Stepper {
     Stepper(int number_of_steps, int motor_pin_1, int motor_pin_2,
                                  int motor_pin_3, int motor_pin_4);
     Stepper(int number_of_steps, int motor_pin_1, int motor_pin_2,
+            int motor_pin_3, int motor_pin_4, bool useMCP, Adafruit_MCP23X17 mcp);
+    Stepper(int number_of_steps, int motor_pin_1, int motor_pin_2,
                                  int motor_pin_3, int motor_pin_4,
                                  int motor_pin_5);
 
@@ -97,6 +101,10 @@ class Stepper {
     void step(int number_of_steps);
 
     int version(void);
+
+    bool useMCP = false;
+
+    Adafruit_MCP23X17 mcp;
 
   private:
     void stepMotor(int this_step);

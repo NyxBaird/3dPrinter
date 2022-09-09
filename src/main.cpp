@@ -1,19 +1,25 @@
 #include <Arduino.h>
+
 #include <WiFi.h>
+#include <Wire.h>
 #include <Stepper.h>
+#include <TFT_eSPI.h>
+#include <AsyncUDP.h>
 #include <IRremote.hpp>
-#include <LiquidCrystal_I2C.h>
 #include <ArduinoJson.h>
 #include <ArduinoHttpClient.h>
-#include <AsyncUDP.h>
+#include <Adafruit_MCP23X17.h>
+
+//In /c/Users/<user>/.platformio/packages/framework-arduinoespressif\variants\ttgo-t1\pins_arduino.h:24
+//Changed SCL pin from 23 to 22
+TFT_eSPI tft = TFT_eSPI();
+
+Adafruit_MCP23X17 mcp = Adafruit_MCP23X17();
 
 AsyncUDP UDP;
 char server[] = "hauntedhallow.xyz";
 WiFiClient client;
 HttpClient httpClient = HttpClient(client, server, 80);
-
-//Set our display properties
-LiquidCrystal_I2C lcd(0x27, 16, 2);
 
 // change this to the number of steps on your motor
 #define STEPS 100
@@ -46,6 +52,8 @@ struct IRButtons{
 };
 IRButtons buttons;
 
+const int Button1 = 35;
+
 struct PrintBed{
     int size = 260;
     int width = size;
@@ -57,23 +65,24 @@ PrintBed bed;
 //Motor stuff
 struct Motor{
     bool ready = false;
+    bool useMcp = false; //Use our external mcp pins?
     float position;
     float lastPosition;
-    int button1;
-    int button2;
     int pins[4] = {0};
-    Stepper stepper = Stepper(STEPS, 0, 0, 0, 0);
+    int switches[2] = {-1, -1};
+    Stepper stepper = Stepper(STEPS, 0, 0, 0, 0, useMcp, mcp);
     void init(int steps = STEPS, int speed = 30) {
-        pinMode(button1, INPUT);
-        pinMode(button2, INPUT);
 
-        pinMode(pins[0], OUTPUT);
-        pinMode(pins[1], OUTPUT);
-        pinMode(pins[2], OUTPUT);
-        pinMode(pins[3], OUTPUT);
+        if (switches[0] > -1) {
+            Serial.println("Initialized switches on pins " + String(switches[0]) + " & " + String(switches[1]));
+            mcp.pinMode(switches[0], INPUT_PULLUP);
+            mcp.pinMode(switches[1], INPUT_PULLUP);
+        }
 
-        stepper = Stepper(steps, pins[0], pins[1], pins[2], pins[3]);
-        stepper.setSpeed(speed); // set the speed of the motor to 30 RPMs
+        Serial.println("Initializing motor on pins " + String(pins[0]) + ", " +  String(pins[1]) + ", " + String(pins[2]) + " & " + String(pins[3]) + " | Uses MCP: " + String(useMcp));
+
+        stepper = Stepper(steps, pins[0], pins[1], pins[2], pins[3], useMcp, mcp);
+        stepper.setSpeed(speed);
     }
     bool scrolling = false;
     float source;
@@ -108,6 +117,9 @@ struct Motor{
     }
 };
 Motor motors[3];
+bool goingUp = false;
+bool goingDwn = false;
+
 bool isInitialized() {
     bool initialized = true;
     for (auto & motor : motors) {
@@ -141,6 +153,8 @@ struct PenObj {
 };
 PenObj Pen;
 
+String version = "3.1";
+IPAddress LocalIP(192, 168, 1, 222);
 
 void sendPost(String uri, String data) {
     httpClient.beginRequest();
@@ -158,23 +172,30 @@ void sendStatus() {
 
 void drawScreen(String message = "", bool updateStatus = true);
 void drawScreen(String message, bool updateStatus) {
-    lcd.clear();
+    Serial.println("Drawing screen...");
 
-    // set cursor to first column, second row
-    lcd.setCursor(0,0);
+    //Draw our background
+    tft.fillScreen(TFT_BLACK);
 
-    if (message != "") {
-        lcd.print(message);
-    }
-    else {
-        if (WiFi.status() == WL_CONNECTED)
-            lcd.print("Connected!");
+    String ip = WiFi.localIP().toString();
 
-        lcd.setCursor(0, 1);
-        if (Pen.FeedMode)
-            lcd.print("FEED MODE (Z Axis)");
-        else
-            lcd.print(isInitialized() ? "READY" : "PLEASE INIT");
+    Serial.println("str ip: " + ip + " | " + WiFi.status());
+
+    //Draw IP and version
+    tft.setTextColor(TFT_WHITE);
+    tft.drawString("IP: " + LocalIP.toString(), 3, 126, 1);
+    tft.drawString("v" + version, 207, 126, 1);
+
+    if (WiFi.status() != WL_CONNECTED && WiFi.status() != 255) {
+        tft.setTextColor(TFT_RED);
+        tft.drawString("DISCONNECTED!", 20, 58, 4);
+
+        //Else display whatever message we were passed here
+    } else {
+        tft.setTextColor(TFT_BLUE);
+        message = "Connected!";
+        tft.drawString(message, 45
+                       , 58, 4);
     }
 
     if (updateStatus)
@@ -220,18 +241,6 @@ void initialize(bool skipRewind) {
 
             buffer--;
         }
-
-        delay(1000);
-
-        //Set a small margin
-        int margin = 5;
-        while (margin > 0) {
-            for (int i = 0; i < 2; i++)
-                if (i < 2)
-                    motors[i].stepper.step(-1);
-
-            margin--;
-        }
     }
 
     for (auto & motor : motors) {
@@ -258,7 +267,6 @@ void extrude(bool backwards) {
     digitalWrite(PEN_FWD, LOW);
 }
 
-IPAddress LocalIP(192, 168, 1, 222);
 void processUdp(AsyncUDPPacket packet) {
     //Validate the incoming IP address
     String source = "UNKNOWN";
@@ -326,23 +334,33 @@ void connectToWifi() {
     if (WiFi.status() == WL_CONNECTED) {
         Serial.println();
         Serial.print("Connected, IP address: ");
-        Serial.println(WiFi.localIP());
+        Serial.println(WiFi.localIP().toString());
         Serial.print("MAC Address: ");
         Serial.println(WiFi.macAddress());
         Serial.print("Gateway IP: ");
         Serial.println(WiFi.gatewayIP());
         Serial.print("DNS Server: ");
         Serial.println(WiFi.dnsIP());
-
-        drawScreen();
     }
 }
+
 void setup() {
+    //Init the display
+    tft.init();
+    tft.setRotation(3);
+    tft.setSwapBytes(true);
+
+    tft.fillScreen(TFT_BLACK);
+
     Serial.begin(115200);
 
-    lcd.init();
-    lcd.backlight();
     drawScreen("Booting Up...");
+
+    if (!mcp.begin_I2C()) {
+        Serial.println("Error Initializing MCP.");
+    }
+
+    pinMode(Button1, INPUT);
 
     //3D Pen
     pinMode(PEN_BCK, OUTPUT); //Bck
@@ -359,34 +377,38 @@ void setup() {
         });
     }
 
-    IrReceiver.begin(18);
+    IrReceiver.begin(36);
 
-    motors[0].button1 = 34;
-    motors[0].button2 = 35;
-    motors[0].pins[0] = 26;
-    motors[0].pins[1] = 27;
-    motors[0].pins[2] = 14;
-    motors[0].pins[3] = 13;
+    mcp.pinMode(8, INPUT_PULLUP);
+    mcp.pinMode(9, INPUT_PULLUP);
+    mcp.pinMode(10, INPUT_PULLUP);
+    mcp.pinMode(11, INPUT_PULLUP);
+
+    motors[0].useMcp = true;
+    motors[0].pins[0] = 4;
+    motors[0].pins[1] = 5;
+    motors[0].pins[2] = 6;
+    motors[0].pins[3] = 7;
     motors[0].init();
 
-    motors[1].button1 = 36;
-    motors[1].button2 = 39;
-    motors[1].pins[0] = 32;
-    motors[1].pins[1] = 33;
-    motors[1].pins[2] = 25;
-    motors[1].pins[3] = 5;
+    motors[1].useMcp = true;
+    motors[1].pins[0] = 0;
+    motors[1].pins[1] = 1;
+    motors[1].pins[2] = 2;
+    motors[1].pins[3] = 3;
     motors[1].init();
 
-    motors[2].button1 = 16;
-    motors[2].button2 = 17;
-    motors[2].pins[0] = 4;
-    motors[2].pins[1] = 0;
-    motors[2].pins[2] = 2;
-    motors[2].pins[3] = 15;
-    motors[2].init(32, 500);
+    motors[2].pins[0] = 27;
+    motors[2].pins[1] = 26;
+    motors[2].pins[2] = 25;
+    motors[2].pins[3] = 33;
+    motors[2].init(32, 200);//.init(2038, 100);
+
+    drawScreen();
 }
 
 void performIRFunction(char event[9]) {
+    alert("IR: " + String(event));
     Serial.println("Caught IR function " + String(event));
 
     //Power Button = Full Initialize
@@ -411,13 +433,27 @@ void performIRFunction(char event[9]) {
         scrollToCoords(half, half, half);
     }
 
-    //Volume Down = Send position to back right corner
-    if (strcmp(event, buttons.volDwn) == 0)
-        scrollToCoords(0, bed.size, bed.size);
+    //Volume Down = toggle lower pen
+    if (strcmp(event, buttons.volDwn) == 0) {
+        Serial.println("Sending down!");
+        if (goingDwn)
+            goingDwn = false;
+        else
+            goingDwn = true;
 
-    //Volume Up = Send position to front left corner
-    if (strcmp(event, buttons.volUp) == 0)
-        scrollToCoords(bed.size, 0, bed.size);
+        goingUp = false;
+    }
+
+    //Volume Up = toggle raise pen
+    if (strcmp(event, buttons.volUp) == 0) {
+        Serial.println("Sending up!");
+        if (goingUp)
+            goingUp = false;
+        else
+            goingUp = true;
+
+        goingDwn = false;
+    }
 
     //Func Button = Turn on pen
     if (strcmp(event, buttons.func) == 0)
@@ -426,15 +462,12 @@ void performIRFunction(char event[9]) {
         else
             Pen.toggleFeedMode();
 
-
-    Serial.println("Finished function " + String(event));
     alert("Func Complete");
 }
 
 bool btnIsPressed = false;
 String lastDisplayStr;
 void loop() {
-
     //Tne global increment value for our steppers
     int increment = 1;
     int motorIndex = 0;
@@ -504,7 +537,13 @@ void loop() {
         motorIndex++;
     }
 
-    //handle ir commands
+    if (goingUp)
+        motors[2].changePosition(1);
+
+    if (goingDwn)
+        motors[2].changePosition(-1);
+
+//    handle ir commands
     if (IrReceiver.decode()) {
         if (IrReceiver.decodedIRData.decodedRawData > 0) {
             char code[9];
@@ -515,88 +554,17 @@ void loop() {
         IrReceiver.resume(); // Enable receiving of the next value
     }
 
-    //Handle Button Presses
-    int motorCount = 0;
-    bool btnWasPressed = btnIsPressed;
-    btnIsPressed = false;
-    String btnDisplayStr = "Mv: "; //Directions are based on a perspective facing the front of the printer
-    for (auto & motor : motors) {
-        if (motor.pins[0] == 0)
-            continue;
+    if (digitalRead(Button1) == LOW) {
+        Serial.println("Redrawing screen...");
 
-        //Btn is actually pressed when false (I think because the pullup resistor reverses this)
-        bool btn1Pressed = !digitalRead(motor.button1);
-        bool btn2Pressed = !digitalRead(motor.button2);
-        if (Pen.FeedMode) {
-            if (btn1Pressed) {
-                btnIsPressed = true;
+        Serial.println("Switch set 8:" + String(mcp.digitalRead(8)) + " | 9: " + String(mcp.digitalRead(9)));
+        Serial.println("Switch set 10: " + String(mcp.digitalRead(10)) + " | 11: " + String(mcp.digitalRead(11)));
 
-                digitalWrite(PEN_FWD, HIGH);
-            }
-            if (btn2Pressed) {
-                btnIsPressed = true;
+        drawScreen("Message");
 
-                digitalWrite(PEN_BCK, HIGH);
-            }
-        } else {
-            if (btn1Pressed) {
-                btnIsPressed = true;
-
-                motor.changePosition(-increment);
-
-                switch (motorCount) {
-                    case 0:
-                        btnDisplayStr += " Bck ";
-                        break;
-                    case 1:
-                        btnDisplayStr += " L ";
-                        break;
-                    case 2:
-                        btnDisplayStr += " Up ";
-                        break;
-                    default:
-                        break;
-                }
-            }
-            if (btn2Pressed) {
-                btnIsPressed = true;
-                motor.changePosition(increment);
-
-                switch (motorCount) {
-                    case 0:
-                        btnDisplayStr += " Fwd ";
-                        break;
-                    case 1:
-                        btnDisplayStr += " R ";
-                        break;
-                    case 2:
-                        btnDisplayStr += " Dwn ";
-                        break;
-                    default:
-                        break;
-                }
-            }
-        }
-
-        motorCount++;
+        delay(500);
     }
 
-    //If we're pressing a directional button display that on the screen
-    if (btnIsPressed) {
-        if (lastDisplayStr != btnDisplayStr)
-            drawScreen(btnDisplayStr);
-
-    //Redraw the screen when we release a button or the last display update time is greater than (roughly) 5 seconds
-    } else if (btnWasPressed || runtime - lastDisplayUpdateTime > 3000000) {
-        Serial.println("Runtime: " + String(runtime) + " | Last Update: " + String(lastDisplayUpdateTime));
-        drawScreen();
-    }
-
-    if (!btnIsPressed && btnWasPressed && Pen.FeedMode) {
-        digitalWrite(PEN_BCK, LOW);
-        digitalWrite(PEN_FWD, LOW);
-    }
-
-    lastDisplayStr = btnDisplayStr;
+    lastDisplayStr = "";
     runtime++;
 }

@@ -9,6 +9,7 @@
 #include <ArduinoJson.h>
 #include <ArduinoHttpClient.h>
 #include <Adafruit_MCP23X17.h>
+#include <ESP32Servo.h>
 
 //In /c/Users/<user>/.platformio/packages/framework-arduinoespressif\variants\ttgo-t1\pins_arduino.h:24
 //Changed SCL pin from 23 to 22
@@ -27,31 +28,6 @@ HttpClient httpClient = HttpClient(client, server, 80);
 int runtime = 0;
 int lastDisplayUpdateTime;
 
-struct IRButtons{
-    char power[9] = "ba45ff00";
-    char volUp[9] = "b946ff00";
-    char func[9] = "b847ff00";
-    char back[9] = "bb44ff00";
-    char play[9] = "bf40ff00";
-    char frwrd[9] = "bc43ff00";
-    char down[9] = "f807ff00";
-    char volDwn[9] = "ea15ff00";
-    char up[9] = "f609ff00";
-    char zero[9] = "e916ff00";
-    char eq[9] = "e619ff00";
-    char repeat[9] = "f20dff00";
-    char one[9] = "f30cff00";
-    char two[9] = "e718ff00";
-    char three[9] = "a15eff00";
-    char four[9] = "f708ff00";
-    char five[9] = "e31cff00";
-    char six[9] = "a55aff00";
-    char seven[9] = "bd42ff00";
-    char eight[9] = "ad52ff00";
-    char nine[9] = "b54aff00";
-};
-IRButtons buttons;
-
 const int Button1 = 35;
 
 struct PrintBed{
@@ -64,8 +40,10 @@ PrintBed bed;
 
 //Motor stuff
 struct Motor{
+    int max = 0; //This is how many steps our stepper can take
     bool ready = false;
     bool useMcp = false; //Use our external mcp pins?
+    bool reverseDirection = false;
     float position;
     float lastPosition;
     int pins[4] = {0};
@@ -81,7 +59,11 @@ struct Motor{
 
         Serial.println("Initializing motor on pins " + String(pins[0]) + ", " +  String(pins[1]) + ", " + String(pins[2]) + " & " + String(pins[3]) + " | Uses MCP: " + String(useMcp));
 
-        stepper = Stepper(steps, pins[0], pins[1], pins[2], pins[3], useMcp, mcp);
+        if (reverseDirection)
+            stepper = Stepper(steps, pins[2], pins[3], pins[0], pins[1], useMcp, mcp);
+        else
+            stepper = Stepper(steps, pins[0], pins[1], pins[2], pins[3], useMcp, mcp);
+
         stepper.setSpeed(speed);
     }
     bool scrolling = false;
@@ -117,8 +99,6 @@ struct Motor{
     }
 };
 Motor motors[3];
-bool goingUp = false;
-bool goingDwn = false;
 
 bool isInitialized() {
     bool initialized = true;
@@ -133,22 +113,62 @@ bool isInitialized() {
 }
 
 //Pen vars
-#define PEN_FWD 19
-#define PEN_BCK 12
+#define PEN_FWD 12
+#define PEN_BCK 13
 struct PenObj {
+    Servo speed;
     bool Hot = false;
-    bool FeedMode = false;
+    bool Retracting = false;
+    bool Extruding = false;
+    void init(){
+        Serial.println("Attaching servo pin");
+        speed.attach(2);
+        speed.write(90); //halfway between 0 and 180
+    };
     void heat() {
+        Serial.println("Heating pen...");
         digitalWrite(PEN_FWD, HIGH);
         delay(500);
         digitalWrite(PEN_FWD, LOW);
         Hot = true;
     }
-    void toggleFeedMode() {
-        if (FeedMode)
-            FeedMode = false;
-        else
-            FeedMode = true;
+    void toggleRetract() {
+        if (Extruding) {
+            Serial.println("Could not retract while extruding!");
+            return;
+        }
+
+        //Handle pen functions
+        if (!Retracting) {
+            Serial.println("Began retracting");
+            Retracting = true;
+            digitalWrite(PEN_BCK, HIGH);
+        } else {
+            Serial.println("Began retracting");
+            Retracting = false;
+            digitalWrite(PEN_BCK, LOW);
+        }
+    }
+    void toggleExtrude() {
+        if (Retracting) {
+            Serial.println("Could not extrude while retracting!");
+            return;
+        }
+
+        //Handle pen functions
+        if (!Extruding) {
+            Serial.println("Began extruding");
+            Extruding = true;
+            digitalWrite(PEN_FWD, HIGH);
+        } else {
+            Serial.println("Stopped extruding");
+            Extruding = false;
+            digitalWrite(PEN_FWD, LOW);
+        }
+    }
+    void setSpeed(int newSpeed) {
+        Serial.println("Setting speed to " + String(newSpeed));
+        speed.write(newSpeed);
     }
 };
 PenObj Pen;
@@ -172,6 +192,9 @@ void sendStatus() {
 
 void drawScreen(String message = "", bool updateStatus = true);
 void drawScreen(String message, bool updateStatus) {
+    if (runtime - lastDisplayUpdateTime < 30000)
+        return;
+
     Serial.println("Drawing screen...");
 
     //Draw our background
@@ -214,57 +237,176 @@ void alert(String message, int timer) {
 }
 
 //Use -1 to not move axis at all
-void scrollToCoords(float x, float y, float z) {
-    for (int i = 0; i < 3; i++) {
-        if (i == 0 && x > -1)
-            motors[i].scrollTo(x);
+void scrollToCoords(float x, float y, float z, bool useRelative = false);
+void scrollToCoords(float x, float y, float z, bool useRelative) {
+    Serial.println("Sending to coords: " + String(x) + " | " + String(y) + " | " + String(z));
 
-        if (i == 1 && y > -1)
-            motors[i].scrollTo(y);
-
-        if (i == 2 && z > -1)
-            motors[i].scrollTo(z);
+    if (useRelative) {
+        x = motors[0].position + x;
+        y = motors[1].position + y;
+        z = motors[2].position + z;
     }
+
+    if (x > -1)
+        motors[0].scrollTo(x);
+
+    if (y > -1)
+        motors[1].scrollTo(y);
+
+    if (z > -1)
+        motors[2].scrollTo(z);
 }
 
-void initialize(bool skipRewind = false);
-void initialize(bool skipRewind) {
+void initialize() {
     alert("Initializing...");
     delay(500);
 
-    if (!skipRewind) {
-        //Move all our motors to their starting positions
-        int buffer = 300;
-        while (buffer > 0) {
-            for (int m = 0; m < 2; m++)
-                motors[m].stepper.step(+1);
+    Serial.println("Switch set 8:" + String(mcp.digitalRead(8)) + " | 9: " + String(mcp.digitalRead(9)));
+    Serial.println("Switch set 10: " + String(mcp.digitalRead(10)) + " | 11: " + String(mcp.digitalRead(11)));
+    Serial.println("Switch set 12: " + String(mcp.digitalRead(12)) + " | 13: " + String(mcp.digitalRead(13)));
 
-            buffer--;
+    // Zero out all axis
+    while (mcp.digitalRead(8) == HIGH || mcp.digitalRead(10) == HIGH || mcp.digitalRead(12) == HIGH) {
+        if (mcp.digitalRead(8) == HIGH)
+            motors[0].stepper.step(-1);
+
+        if (mcp.digitalRead(10) == HIGH)
+            motors[1].stepper.step(-1);
+
+        if (mcp.digitalRead(12) == HIGH)
+            motors[2].stepper.step(-1);
+    }
+
+    motors[0].position = 0;
+    motors[1].position = 0;
+    motors[2].position = 0;
+
+    Serial.println("Zero'd out all axis'.");
+
+    // Max out all axis
+    while (mcp.digitalRead(9) == HIGH || mcp.digitalRead(11) == HIGH || mcp.digitalRead(13) == HIGH) {
+        if (mcp.digitalRead(9) == HIGH) {
+            motors[0].stepper.step(1);
+            motors[0].position++;
+        }
+
+        if (mcp.digitalRead(11) == HIGH) {
+            motors[1].stepper.step(1);
+            motors[1].position++;
+        }
+
+        if (mcp.digitalRead(13) == HIGH) {
+            motors[2].stepper.step(1);
+            motors[2].position++;
         }
     }
 
-    for (auto & motor : motors) {
-        motor.ready = true;
-        motor.position = 0;
-    }
+    motors[0].max = motors[0].position;
+    motors[1].max = motors[1].position;
+    motors[2].max = motors[2].position;
+
+//    while (motors[0].position > (motors[0].max / 2)) {
+//        motors[0].stepper.step(1);
+//    }
+
+    motors[0].ready = true;
+    motors[1].ready = true;
+    motors[2].ready = true;
+
+    Serial.println("Initialized axis with the following sizes;");
+    Serial.println("X: " + String(motors[0].max) + " | Y: " + String(motors[1].max) + " | Z: " + String(motors[2].max));
+
+    scrollToCoords(motors[0].max / 2, motors[1].max / 2, 0);
+
+    Serial.println("Initialization complete!");
 
     //Draw the screen again after we re-init
     drawScreen();
 }
 
-void extrude(bool backwards = false);
-void extrude(bool backwards) {
-    Serial.println("Extruding | " + String(backwards));
-    if (backwards) {
-        digitalWrite(PEN_BCK, HIGH);
-        delay(5000);
-        digitalWrite(PEN_BCK, LOW);
-        return;
-    }
+struct IRButtons{
+    char power[9] = "ba45ff00";
+    char volUp[9] = "b946ff00";
+    char func[9] = "b847ff00";
+    char back[9] = "bb44ff00";
+    char play[9] = "bf40ff00";
+    char frwrd[9] = "bc43ff00";
+    char down[9] = "f807ff00";
+    char volDwn[9] = "ea15ff00";
+    char up[9] = "f609ff00";
+    char zero[9] = "e916ff00";
+    char eq[9] = "e619ff00";
+    char repeat[9] = "f20dff00";
+    char one[9] = "f30cff00";
+    char two[9] = "e718ff00";
+    char three[9] = "a15eff00";
+    char four[9] = "f708ff00";
+    char five[9] = "e31cff00";
+    char six[9] = "a55aff00";
+    char seven[9] = "bd42ff00";
+    char eight[9] = "ad52ff00";
+    char nine[9] = "b54aff00";
+};
+IRButtons buttons;
+void performIRFunction(char event[9]) {
+    alert("IR: " + String(event));
+    Serial.println("Caught IR function " + String(event));
 
-    digitalWrite(PEN_FWD, HIGH);
-    delay(5000);
-    digitalWrite(PEN_FWD, LOW);
+    //Power Button = Full Initialize
+    if (strcmp(event, buttons.power) == 0)
+        initialize();
+    else
+        //Zero Button = Set initialized without moving motors
+    if (strcmp(event, buttons.zero) == 0)
+        initialize();
+    else
+        //Skip Back = Zero all motors
+    if (strcmp(event, buttons.back) == 0)
+        scrollToCoords(0, 0, -1);
+    else
+        //Skip Forward = Max all motors
+    if (strcmp(event, buttons.frwrd) == 0)
+        scrollToCoords(bed.size, bed.size, -1);
+    else
+        //Play Button = Center all motors
+    if (strcmp(event, buttons.play) == 0) {
+        float half = (float)bed.size / 2;
+        scrollToCoords(half, half, -1);
+    } else
+        //Volume Down = toggle lower pen
+    if (strcmp(event, buttons.volDwn) == 0) {
+        Serial.println("Sending down!");
+        scrollToCoords(-1, -1, -50, true);
+    } else
+        //Volume Up = toggle raise pen
+    if (strcmp(event, buttons.volUp) == 0) {
+        Serial.println("Sending up!");
+        scrollToCoords(-1, -1, 50, true);
+    } else
+        //Func Button = Turn on pen
+    if (strcmp(event, buttons.func) == 0) {
+        if (!Pen.Hot)
+            Pen.heat();
+    } else
+
+        //Up Button = Retract
+    if (strcmp(event, buttons.up) == 0)
+        Pen.toggleRetract();
+    else
+
+        //Down Button = Extrude
+    if (strcmp(event, buttons.down) == 0)
+        Pen.toggleExtrude();
+    else
+
+    if (strcmp(event, buttons.one) == 0)
+        Pen.setSpeed(0);
+    else
+
+    if (strcmp(event, buttons.two) == 0)
+        Pen.setSpeed(180);
+
+    alert("Func Complete");
 }
 
 void processUdp(AsyncUDPPacket packet) {
@@ -298,9 +440,9 @@ void processUdp(AsyncUDPPacket packet) {
             if (!Pen.Hot)
                 Pen.heat();
         } else if (json["CMD"] == "PEN_FWD") {
-            extrude();
+            Pen.toggleExtrude();
         } else if (json["CMD"] == "PEN_BCK") {
-            extrude(true);
+            Pen.toggleRetract();
         } else
             alert("Requested action not recognized.");
     } else
@@ -318,8 +460,8 @@ void connectToWifi() {
     ))
         Serial.println("STA Failed to configure");
 
-    const char* ssid       = "Garden Amenities";
-    const char* password   = "Am3nit1es4b1tch35";
+    const char* ssid       = "###";
+    const char* password   = "###";
     Serial.println("Connecting to " + String(ssid));
 
     WiFi.begin(ssid, password);
@@ -365,6 +507,7 @@ void setup() {
     //3D Pen
     pinMode(PEN_BCK, OUTPUT); //Bck
     pinMode(PEN_FWD, OUTPUT); //Fwd
+    Pen.init();
 
     //connect to WiFi
     connectToWifi();
@@ -379,100 +522,51 @@ void setup() {
 
     IrReceiver.begin(36);
 
-    mcp.pinMode(8, INPUT_PULLUP);
-    mcp.pinMode(9, INPUT_PULLUP);
-    mcp.pinMode(10, INPUT_PULLUP);
-    mcp.pinMode(11, INPUT_PULLUP);
+    /*
+     * Initialize our axis'
+     * Note that all directions are relative to the viewer when facing the printer.
+     */
 
+    //X Axis - Left/Right
     motors[0].useMcp = true;
-    motors[0].pins[0] = 4;
-    motors[0].pins[1] = 5;
-    motors[0].pins[2] = 6;
-    motors[0].pins[3] = 7;
+    motors[0].switches[0] = 8;
+    motors[0].switches[1] = 9;
+    motors[0].pins[0] = 0;
+    motors[0].pins[1] = 1;
+    motors[0].pins[2] = 2;
+    motors[0].pins[3] = 3;
+    motors[0].reverseDirection = true;
     motors[0].init();
 
+    //Y Axis - Backwards/Forwards
     motors[1].useMcp = true;
-    motors[1].pins[0] = 0;
-    motors[1].pins[1] = 1;
-    motors[1].pins[2] = 2;
-    motors[1].pins[3] = 3;
+    motors[1].switches[0] = 10;
+    motors[1].switches[1] = 11;
+    motors[1].pins[0] = 4;
+    motors[1].pins[1] = 5;
+    motors[1].pins[2] = 6;
+    motors[1].pins[3] = 7;
+    motors[1].reverseDirection = true;
     motors[1].init();
 
+    //Z Axis - Up/Down
+    motors[2].switches[0] = 12;
+    motors[2].switches[1] = 13;
     motors[2].pins[0] = 27;
     motors[2].pins[1] = 26;
     motors[2].pins[2] = 25;
     motors[2].pins[3] = 33;
-    motors[2].init(32, 200);//.init(2038, 100);
-
-    drawScreen();
+    motors[2].reverseDirection = true;
+    motors[2].init(32, 200);
 }
 
-void performIRFunction(char event[9]) {
-    alert("IR: " + String(event));
-    Serial.println("Caught IR function " + String(event));
-
-    //Power Button = Full Initialize
-    if (strcmp(event, buttons.power) == 0)
-        initialize();
-
-    //Zero Button = Set initialized without moving motors
-    if (strcmp(event, buttons.zero) == 0)
-        initialize(true);
-
-    //Skip Back = Zero all motors
-    if (strcmp(event, buttons.back) == 0)
-        scrollToCoords(0, 0, 0);
-
-    //Skip Forward = Max all motors
-    if (strcmp(event, buttons.frwrd) == 0)
-        scrollToCoords(bed.size, bed.size, bed.size);
-
-    //Play Button = Center all motors
-    if (strcmp(event, buttons.play) == 0) {
-        float half = (float)bed.size / 2;
-        scrollToCoords(half, half, half);
-    }
-
-    //Volume Down = toggle lower pen
-    if (strcmp(event, buttons.volDwn) == 0) {
-        Serial.println("Sending down!");
-        if (goingDwn)
-            goingDwn = false;
-        else
-            goingDwn = true;
-
-        goingUp = false;
-    }
-
-    //Volume Up = toggle raise pen
-    if (strcmp(event, buttons.volUp) == 0) {
-        Serial.println("Sending up!");
-        if (goingUp)
-            goingUp = false;
-        else
-            goingUp = true;
-
-        goingDwn = false;
-    }
-
-    //Func Button = Turn on pen
-    if (strcmp(event, buttons.func) == 0)
-        if (!Pen.Hot)
-            Pen.heat();
-        else
-            Pen.toggleFeedMode();
-
-    alert("Func Complete");
-}
-
-bool btnIsPressed = false;
-String lastDisplayStr;
 void loop() {
     //Tne global increment value for our steppers
     int increment = 1;
     int motorIndex = 0;
     for (auto & motor : motors) {
         if (motor.scrolling) {
+
             //If the motor is moving forward and is at or past its destination,
             //Or if the motor is moving backwards and is at or in front of its destination,
             if (motor.lastPosition < motor.position && motor.position >= motor.destination ||
@@ -487,7 +581,7 @@ void loop() {
 
                 Serial.println("updating motor destination from " + String(motor.position) + " to " + String(motor.destination));
 
-                //If this isn't a vertical axis
+                //If this isn't our vertical axis then normalize our diagonal movement
                 if (motorIndex != 2) {
 
                     //pos1 = 25 | dest1 = 32
@@ -537,12 +631,6 @@ void loop() {
         motorIndex++;
     }
 
-    if (goingUp)
-        motors[2].changePosition(1);
-
-    if (goingDwn)
-        motors[2].changePosition(-1);
-
 //    handle ir commands
     if (IrReceiver.decode()) {
         if (IrReceiver.decodedIRData.decodedRawData > 0) {
@@ -559,12 +647,12 @@ void loop() {
 
         Serial.println("Switch set 8:" + String(mcp.digitalRead(8)) + " | 9: " + String(mcp.digitalRead(9)));
         Serial.println("Switch set 10: " + String(mcp.digitalRead(10)) + " | 11: " + String(mcp.digitalRead(11)));
+        Serial.println("Switch set 12: " + String(mcp.digitalRead(12)) + " | 13: " + String(mcp.digitalRead(13)));
 
         drawScreen("Message");
 
         delay(500);
     }
 
-    lastDisplayStr = "";
     runtime++;
 }
